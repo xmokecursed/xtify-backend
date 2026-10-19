@@ -1,0 +1,351 @@
+const express = require('express');
+const ytDlpExec = require('yt-dlp-exec');
+const axios = require('axios');
+const cors = require('cors');
+const path = require('path');
+const fs = require('fs');
+const app = express();
+const port = process.env.PORT || 3000;
+
+app.use(cors());
+app.use(express.json());
+
+// Set LASTFM_API_KEY in the Render environment (no hardcoded fallback)
+const LASTFM_API_KEY = process.env.LASTFM_API_KEY || 'c73293f2ff9bf7eefc3e339e52767f28';
+const LASTFM_API_URL = 'http://ws.audioscrobbler.com/2.0/';
+
+// Last.fm returns a single object instead of an array when there is one item
+const toArray = x => (x == null ? [] : Array.isArray(x) ? x : [x]);
+
+let YOUTUBE_COOKIES_PATH = process.env.YOUTUBE_COOKIES_PATH;
+if (!YOUTUBE_COOKIES_PATH) {
+  const secretPath = path.join('/etc/secrets', 'youtube_cookies.txt');
+  if (fs.existsSync(secretPath)) YOUTUBE_COOKIES_PATH = secretPath;
+}
+
+async function searchWithYtDlp(q) {
+  const opts = {
+    dumpSingleJson: true,
+    noWarnings: true,
+    flatPlaylist: true,
+    skipDownload: true,
+  };
+
+  let tmpPath = null;
+  if (YOUTUBE_COOKIES_PATH) {
+    tmpPath = `/tmp/youtube_cookies_${Date.now()}_${Math.floor(Math.random() * 10000)}.txt`;
+    try {
+      fs.copyFileSync(YOUTUBE_COOKIES_PATH, tmpPath);
+      opts.cookies = tmpPath;
+    } catch (e) {
+      tmpPath = null;
+    }
+  }
+  try {
+    const info = await ytDlpExec(`ytsearch10:${q}`, opts);
+    return (info.entries || [])
+      .filter(v => v && v.id)
+      .map(v => ({
+        id: v.id,
+        title: v.title,
+        thumb: v.thumbnails?.[0]?.url,
+        duration: v.duration,
+      }));
+  } finally {
+    if (tmpPath) fs.unlink(tmpPath, () => {});
+  }
+}
+
+// Fallback
+
+const DEFAULT_INSTANCES = [
+  'https://pipedapi.ducks.party',
+  'https://api.piped.private.coffee',
+  'https://pipedapi.leptons.xyz',
+  'https://pipedapi.adminforge.de',
+  'https://pipedapi.kavin.rocks',
+  'https://pipedapi-libre.kavin.rocks',
+];
+const PIPED_INSTANCES = (process.env.PIPED_INSTANCES
+  ? process.env.PIPED_INSTANCES.split(',')
+  : DEFAULT_INSTANCES
+).map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
+
+const VIDEO_ID = /^[a-zA-Z0-9_-]{11}$/;
+
+async function searchWithPiped(q) {
+  const errors = [];
+  const order = PIPED_INSTANCES.map(x => [Math.random(), x]).sort((a, b) => a[0] - b[0]).map(p => p[1]);
+  for (const base of order.slice(0, 4)) {
+    try {
+      const r = await axios.get(base + '/search', { params: { q, filter: 'videos' }, timeout: 8000 });
+      if (!r.data || !Array.isArray(r.data.items)) throw new Error('bad response');
+      return r.data.items
+        .filter(i => i.type === 'stream' && i.url)
+        .map(v => ({
+          id: (v.url.split('v=')[1] || '').split('&')[0],
+          title: v.title,
+          thumb: v.thumbnail,
+          duration: v.duration,
+        }))
+        .filter(v => VIDEO_ID.test(v.id))
+        .slice(0, 10);
+    } catch (e) {
+      errors.push(`${base}: ${e.response ? 'HTTP ' + e.response.status : e.message}`);
+    }
+  }
+  throw new Error(errors.join(' | '));
+}
+
+const CACHE_TTL_MS = 10 * 60 * 1000;
+const CACHE_MAX = 200;
+const searchCache = new Map();
+
+// Hedged search: start yt-dlp right away; if it hasn't answered after HEDGE_MS
+// (or fails), also ask Piped and use whichever returns results first.
+const HEDGE_MS = 2000;
+
+async function searchHedged(q) {
+  const started = Date.now();
+  let done = false;
+  const nonEmpty = (source) => (results) => {
+    if (!results.length) throw new Error('no results');
+    return { source, results };
+  };
+  let wake;
+  const hedge = new Promise(resolve => {
+    const timer = setTimeout(resolve, HEDGE_MS);
+    wake = () => { clearTimeout(timer); resolve(); };
+  });
+  const ytAttempt = searchWithYtDlp(q).then(nonEmpty('yt-dlp'));
+  ytAttempt.catch(() => wake()); // yt-dlp failed: ask Piped right away
+  const pipedAttempt = hedge.then(() => {
+    if (done) throw new Error('skipped (yt-dlp answered first)');
+    return searchWithPiped(q);
+  }).then(nonEmpty('piped'));
+  const attempts = [ytAttempt, pipedAttempt];
+  try {
+    const winner = await Promise.any(attempts);
+    done = true;
+    console.log(`search "${q}" via ${winner.source} in ${Date.now() - started}ms`);
+    return winner.results;
+  } catch (e) {
+    done = true;
+    const [ytErr, pipedErr] = e.errors || [];
+    console.log(`search "${q}" failed in ${Date.now() - started}ms`);
+    const err = new Error('Search failed');
+    err.details = {
+      ytDlp: (ytErr?.message || '').slice(0, 300),
+      piped: (pipedErr?.message || '').slice(0, 500),
+    };
+    throw err;
+  }
+}
+
+app.get('/search', async (req, res) => {
+  const q = (req.query.q || '').toString().trim();
+  if (!q) return res.status(400).send({ error: 'Query required' });
+
+  const key = q.toLowerCase();
+  const hit = searchCache.get(key);
+  if (hit && Date.now() - hit.at < CACHE_TTL_MS) return res.send(hit.results);
+
+  try {
+    const results = await searchHedged(q);
+    if (searchCache.size >= CACHE_MAX) searchCache.delete(searchCache.keys().next().value);
+    searchCache.set(key, { at: Date.now(), results });
+    res.send(results);
+  } catch (e) {
+    res.status(502).send({ error: e.message, ...(e.details || {}) });
+  }
+});
+
+app.get('/similar/:artist', async (req, res) => {
+  try {
+    const { artist } = req.params;
+    const response = await axios.get(LASTFM_API_URL, {
+      params: {
+        method: 'artist.getsimilar',
+        artist,
+        api_key: LASTFM_API_KEY,
+        format: 'json',
+        limit: 10,
+      },
+    });
+    if (!response.data.similarartists || !response.data.similarartists.artist) {
+      return res.send([]);
+    }
+    const artists = response.data.similarartists.artist.map(a => ({
+      name: a.name,
+      url: a.url,
+      image: a.image.find(i => i.size === 'large')?.['#text'],
+    }));
+    res.send(artists);
+  } catch (e) {
+    res.status(500).send({ error: e.message });
+  }
+});
+
+app.get('/radio/:artist', async (req, res) => {
+  try {
+    const { artist } = req.params;
+    const response = await axios.get(LASTFM_API_URL, {
+      params: {
+        method: 'artist.gettoptracks',
+        artist,
+        api_key: LASTFM_API_KEY,
+        format: 'json',
+        limit: 10,
+      },
+    });
+    if (!response.data.toptracks || !response.data.toptracks.track) {
+      return res.send([]);
+    }
+    const tracks = response.data.toptracks.track.map(t => ({
+      name: t.name,
+      artist: t.artist.name,
+      url: t.url,
+      duration: t.duration,
+    }));
+    res.send(tracks);
+  } catch (e) {
+    res.status(500).send({ error: e.message });
+  }
+});
+
+// Similar tracks (Last.fm track.getsimilar): powers the app's auto-queue
+app.get('/similar-tracks/:artist/:track', async (req, res) => {
+  try {
+    const { artist, track } = req.params;
+    const limit = Math.min(parseInt(req.query.limit) || 30, 50);
+    const response = await axios.get(LASTFM_API_URL, {
+      params: {
+        method: 'track.getsimilar',
+        artist,
+        track,
+        autocorrect: 1,
+        api_key: LASTFM_API_KEY,
+        format: 'json',
+        limit,
+      },
+    });
+    const similar = toArray(response.data.similartracks?.track);
+    res.send(
+      similar
+        .map(t => ({
+          name: t.name,
+          artist: t.artist?.name,
+          match: parseFloat(t.match) || 0,
+        }))
+        .filter(t => t.name && t.artist),
+    );
+  } catch (e) {
+    res.status(500).send({ error: e.message });
+  }
+});
+
+app.get('/test', (req, res) => {
+  res.send('OK');
+});
+
+// Get album information
+app.get('/album/:artist/:album', async (req, res) => {
+  try {
+    const { artist, album } = req.params;
+    const response = await axios.get(LASTFM_API_URL, {
+      params: {
+        method: 'album.getinfo',
+        artist,
+        album,
+        api_key: LASTFM_API_KEY,
+        format: 'json',
+      },
+    });
+
+    if (!response.data.album) {
+      return res.status(404).send({ error: 'Album not found' });
+    }
+
+    const albumData = response.data.album;
+    const formattedAlbum = {
+      name: albumData.name,
+      artist: albumData.artist,
+      mbid: albumData.mbid,
+      url: albumData.url,
+      image: toArray(albumData.image).reduce((acc, img) => {
+        if (img['#text']) {
+          acc[img.size] = img['#text'];
+        }
+        return acc;
+      }, {}),
+      listeners: parseInt(albumData.listeners) || 0,
+      playcount: parseInt(albumData.playcount) || 0,
+      tags: toArray(albumData.tags?.tag).map(tag => tag.name),
+      tracks: toArray(albumData.tracks?.track).map(track => ({
+        name: track.name,
+        duration: parseInt(track.duration) || 0,
+        url: track.url,
+        streamable: track.streamable?.fulltrack === '1',
+        artist: {
+          name: track.artist?.name,
+          mbid: track.artist?.mbid,
+          url: track.artist?.url,
+        },
+      })),
+    };
+
+    res.send(formattedAlbum);
+  } catch (e) {
+    console.error('Error fetching album info:', e.message);
+    res.status(500).send({ error: 'Failed to fetch album information' });
+  }
+});
+
+// Search for tracks
+app.get('/track/search', async (req, res) => {
+  try {
+    const { q, limit = 10 } = req.query;
+    if (!q) {
+      return res.status(400).send({ error: 'Query parameter "q" is required' });
+    }
+
+    const response = await axios.get(LASTFM_API_URL, {
+      params: {
+        method: 'track.search',
+        track: q,
+        api_key: LASTFM_API_KEY,
+        format: 'json',
+        limit: Math.min(parseInt(limit) || 10, 50), // Cap at 50
+      },
+    });
+
+    const matches = toArray(response.data.results?.trackmatches?.track);
+    if (!matches.length) {
+      return res.send([]);
+    }
+
+    const tracks = matches.map(track => ({
+      name: track.name,
+      artist: track.artist,
+      url: track.url,
+      streamable: track.streamable === '1',
+      listeners: parseInt(track.listeners) || 0,
+      mbid: track.mbid,
+      image: toArray(track.image).reduce((acc, img) => {
+        if (img['#text']) {
+          acc[img.size] = img['#text'];
+        }
+        return acc;
+      }, {}),
+    }));
+
+    res.send(tracks);
+  } catch (e) {
+    console.error('Error searching tracks:', e.message);
+    res.status(500).send({ error: 'Failed to search tracks' });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Server running on http://localhost:${port}`);
+});
