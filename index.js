@@ -23,7 +23,7 @@ if (!YOUTUBE_COOKIES_PATH) {
   if (fs.existsSync(secretPath)) YOUTUBE_COOKIES_PATH = secretPath;
 }
 
-async function searchWithYtDlp(q) {
+async function searchWithYtDlp(q, limit = 25) {
   const opts = {
     dumpSingleJson: true,
     noWarnings: true,
@@ -42,7 +42,7 @@ async function searchWithYtDlp(q) {
     }
   }
   try {
-    const info = await ytDlpExec(`ytsearch10:${q}`, opts);
+    const info = await ytDlpExec(`ytsearch${limit}:${q}`, opts);
     return (info.entries || [])
       .filter(v => v && v.id)
       .map(v => ({
@@ -73,7 +73,7 @@ const PIPED_INSTANCES = (process.env.PIPED_INSTANCES
 
 const VIDEO_ID = /^[a-zA-Z0-9_-]{11}$/;
 
-async function searchWithPiped(q) {
+async function searchWithPiped(q, limit = 25) {
   const errors = [];
   const order = PIPED_INSTANCES.map(x => [Math.random(), x]).sort((a, b) => a[0] - b[0]).map(p => p[1]);
   for (const base of order.slice(0, 4)) {
@@ -89,7 +89,7 @@ async function searchWithPiped(q) {
           duration: v.duration,
         }))
         .filter(v => VIDEO_ID.test(v.id))
-        .slice(0, 10);
+        .slice(0, limit);
     } catch (e) {
       errors.push(`${base}: ${e.response ? 'HTTP ' + e.response.status : e.message}`);
     }
@@ -105,7 +105,7 @@ const searchCache = new Map();
 // (or fails), also ask Piped and use whichever returns results first.
 const HEDGE_MS = 2000;
 
-async function searchHedged(q) {
+async function searchHedged(q, limit = 25) {
   const started = Date.now();
   let done = false;
   const nonEmpty = (source) => (results) => {
@@ -117,11 +117,11 @@ async function searchHedged(q) {
     const timer = setTimeout(resolve, HEDGE_MS);
     wake = () => { clearTimeout(timer); resolve(); };
   });
-  const ytAttempt = searchWithYtDlp(q).then(nonEmpty('yt-dlp'));
+  const ytAttempt = searchWithYtDlp(q, limit).then(nonEmpty('yt-dlp'));
   ytAttempt.catch(() => wake()); // yt-dlp failed: ask Piped right away
   const pipedAttempt = hedge.then(() => {
     if (done) throw new Error('skipped (yt-dlp answered first)');
-    return searchWithPiped(q);
+    return searchWithPiped(q, limit);
   }).then(nonEmpty('piped'));
   const attempts = [ytAttempt, pipedAttempt];
   try {
@@ -146,12 +146,15 @@ app.get('/search', async (req, res) => {
   const q = (req.query.q || '').toString().trim();
   if (!q) return res.status(400).send({ error: 'Query required' });
 
-  const key = q.toLowerCase();
+  // ?limit=25 (5-50). The app asks for more when the user taps "Load more".
+  const limit = Math.min(Math.max(parseInt(req.query.limit) || 25, 5), 50);
+
+  const key = `${q.toLowerCase()}|${limit}`;
   const hit = searchCache.get(key);
   if (hit && Date.now() - hit.at < CACHE_TTL_MS) return res.send(hit.results);
 
   try {
-    const results = await searchHedged(q);
+    const results = await searchHedged(q, limit);
     if (searchCache.size >= CACHE_MAX) searchCache.delete(searchCache.keys().next().value);
     searchCache.set(key, { at: Date.now(), results });
     res.send(results);
@@ -239,6 +242,38 @@ app.get('/similar-tracks/:artist/:track', async (req, res) => {
         }))
         .filter(t => t.name && t.artist),
     );
+  } catch (e) {
+    res.status(500).send({ error: e.message });
+  }
+});
+
+// Trending songs from Last.fm: GET /trending?limit=24[&country=United%20States]
+// Returns [{name, artist}] (no video ids; the app resolves them with /search).
+const trendingCache = new Map();
+const TRENDING_TTL_MS = 60 * 60 * 1000;
+
+app.get('/trending', async (req, res) => {
+  try {
+    const limit = Math.min(Math.max(parseInt(req.query.limit) || 24, 1), 50);
+    const country = (req.query.country || '').toString().trim();
+    const key = `${country.toLowerCase()}|${limit}`;
+    const hit = trendingCache.get(key);
+    if (hit && Date.now() - hit.at < TRENDING_TTL_MS) return res.send(hit.data);
+
+    const response = await axios.get(LASTFM_API_URL, {
+      params: {
+        method: country ? 'geo.gettoptracks' : 'chart.gettoptracks',
+        ...(country ? { country } : {}),
+        api_key: LASTFM_API_KEY,
+        format: 'json',
+        limit,
+      },
+    });
+    const data = toArray(response.data.tracks?.track)
+      .map(t => ({ name: t.name, artist: t.artist?.name }))
+      .filter(t => t.name && t.artist);
+    trendingCache.set(key, { at: Date.now(), data });
+    res.send(data);
   } catch (e) {
     res.status(500).send({ error: e.message });
   }
