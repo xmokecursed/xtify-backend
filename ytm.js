@@ -8,6 +8,33 @@
 const norm = (s) =>
   String(s || '').normalize('NFKC').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
 
+// The artist's name, whichever shape ytmusic-api returned: {artist:{name}}, {artists:{name}},
+// {artists:[{name}, ...]} or a plain string. Radio rows (and video-type rows) differ from
+// search rows, and a missing name used to end up as an empty artist in the app's queue.
+const artistOf = (x) => {
+  const pick = (v) => {
+    if (Array.isArray(v)) return pick(v.find((e) => pick(e)));
+    if (typeof v === 'string') return v.trim();
+    return v && typeof v.name === 'string' ? v.name.trim() : '';
+  };
+  return pick(x?.artists) || pick(x?.artist) || '';
+};
+
+const withTimeout = (p, ms) =>
+  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+
+// Looks up the artist for rows that came without one (one getSong call each, in parallel).
+async function fillArtists(ytm, rows, max = 12) {
+  const missing = rows.filter((r) => r.videoId && !r.artist).slice(0, max);
+  await Promise.all(
+    missing.map(async (r) => {
+      try {
+        r.artist = artistOf(await withTimeout(ytm.getSong(r.videoId), 5000));
+      } catch (e) { /* stays empty: the app skips songs without an artist */ }
+    })
+  );
+}
+
 // The artist's whole name appears in the query ("【Ado】綺羅" contains "Ado").
 // A hint only: it cannot tell "Ado" from "ADO"; artist ids do that.
 const nameInQuery = (name, q) => {
@@ -79,9 +106,14 @@ async function similarSongs(ytm, id, q, artist = '', limit = 25) {
 
   // 2) YouTube Music's radio for it (or for the given id when nothing matched)
   try {
-    for (const s of await ytm.getUpNexts(anchor ? anchor.videoId : id)) {
-      add(s.videoId, s.title, s.artists?.name, s.duration);
-    }
+    const radio = (await ytm.getUpNexts(anchor ? anchor.videoId : id)).map((s) => ({
+      videoId: s.videoId,
+      title: s.title,
+      artist: artistOf(s),
+      duration: s.duration,
+    }));
+    await fillArtists(ytm, radio);
+    for (const r of radio) add(r.videoId, r.title, r.artist, r.duration);
   } catch (e) {
     console.log(`ytm radio failed for ${anchor ? anchor.videoId : id}: ${e.message}`);
   }
@@ -104,7 +136,7 @@ async function similarSongs(ytm, id, q, artist = '', limit = 25) {
     try {
       for (const s of await ytm.getArtistSongs(artistId)) {
         if (s.artist?.artistId && s.artist.artistId !== artistId) continue;
-        add(s.videoId, s.name, s.artist?.name || anchor?.artist?.name || artist, s.duration);
+        add(s.videoId, s.name, artistOf(s) || anchor?.artist?.name || artist, s.duration);
       }
     } catch (e) {
       console.log(`ytm artist songs failed for ${artistId}: ${e.message}`);
@@ -115,7 +147,7 @@ async function similarSongs(ytm, id, q, artist = '', limit = 25) {
   if (out.length < 5) {
     for (const s of results) {
       const same = anchor ? sameArtist(s, anchor) : nameInQuery(s.artist?.name, query);
-      if (same) add(s.videoId, s.name, s.artist?.name, s.duration);
+      if (same) add(s.videoId, s.name, artistOf(s), s.duration);
     }
   }
   return out.slice(0, limit);
@@ -149,7 +181,7 @@ async function artistSongs(ytm, name, limit = 25) {
       out.push({
         id: s.videoId,
         title: s.name,
-        artist: s.artist?.name || found?.name || name,
+        artist: artistOf(s) || found?.name || name,
         duration: s.duration, // seconds, same as /search
         thumb: `https://i.ytimg.com/vi/${s.videoId}/mqdefault.jpg`,
       });
