@@ -5,7 +5,7 @@ const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
 const YTMusic = require('ytmusic-api');
-const { similarSongs } = require('./ytm');
+const { similarSongs, artistSongs } = require('./ytm');
 const app = express();
 const port = process.env.PORT || 3000;
 
@@ -357,6 +357,28 @@ app.get('/ytm/similar/:id', async (req, res) => {
     if (data.length) {
       if (ytmCache.size >= 300) ytmCache.delete(ytmCache.keys().next().value);
       ytmCache.set(id, { at: Date.now(), data });
+    }
+    res.send(data);
+  } catch (e) {
+    res.status(502).send({ error: e.message });
+  }
+});
+
+// GET /ytm/artist/:name -> that artist's own songs from YouTube Music (exact name match).
+// The app builds its per-artist "Mix" playlists from this. Items carry video ids.
+const ytmArtistCache = new Map();
+
+app.get('/ytm/artist/:name', async (req, res) => {
+  const name = (req.params.name || '').trim();
+  if (!name || name.length > 100) return res.status(400).send({ error: 'bad artist name' });
+  const key = name.toLowerCase();
+  const hit = ytmArtistCache.get(key);
+  if (hit && Date.now() - hit.at < CACHE_TTL_MS) return res.send(hit.data);
+  try {
+    const data = await artistSongs(await ytm(), name);
+    if (data.length) {
+      if (ytmArtistCache.size >= 200) ytmArtistCache.delete(ytmArtistCache.keys().next().value);
+      ytmArtistCache.set(key, { at: Date.now(), data });
     }
     res.send(data);
   } catch (e) {

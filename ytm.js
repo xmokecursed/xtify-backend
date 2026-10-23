@@ -121,4 +121,28 @@ async function similarSongs(ytm, id, q, artist = '', limit = 25) {
   return out.slice(0, limit);
 }
 
-module.exports = { similarSongs, pickAnchor };
+// The artist's own songs, found by exact name and taken from their artist page, so
+// "Ado" never mixes in "ADO", "ado nakamura" or a song that merely contains "ado".
+// YouTube Music ranks the real artist first, so the first exact match is used.
+async function artistSongs(ytm, name, limit = 25) {
+  const hits = await ytm.searchArtists(name);
+  const found = hits.find((h) => norm(h.name) === norm(name));
+  if (!found?.artistId) return [];
+  const out = [];
+  const seen = new Set();
+  for (const s of await ytm.getArtistSongs(found.artistId)) {
+    if (!s.videoId || !s.name || seen.has(s.videoId)) continue;
+    if (s.artist?.artistId && s.artist.artistId !== found.artistId) continue;
+    seen.add(s.videoId);
+    out.push({
+      id: s.videoId,
+      title: s.name,
+      artist: s.artist?.name || found.name,
+      duration: s.duration, // seconds, same as /search
+      thumb: `https://i.ytimg.com/vi/${s.videoId}/mqdefault.jpg`,
+    });
+  }
+  return out.slice(0, limit);
+}
+
+module.exports = { similarSongs, pickAnchor, artistSongs };
