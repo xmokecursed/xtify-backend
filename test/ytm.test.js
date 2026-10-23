@@ -139,3 +139,24 @@ test('artistSongs: no exact name match means no songs (nothing invented)', async
   };
   assert.deepStrictEqual(await artistSongs(ytm, 'Ado'), []);
 });
+
+test('artistSongs: getArtistSongs fails (YouTube 400), falls back to song search by artist id', async () => {
+  const ytm = {
+    searchArtists: async () => [{ name: 'Ado', artistId: 'UC_ado' }],
+    getArtistSongs: async () => { throw new Error('Request failed with status code 400'); },
+    searchSongs: async () => [
+      hit('ado1000000a', 'Usseewa', 'Ado', 'UC_ado'),
+      hit('oth1000000b', 'Ado', 'Thud', 'UC_thud'), // title is "Ado", artist is not
+      hit('noid0000001', 'Ghost', 'Ado'), // search row without an id: not trusted
+    ],
+  };
+  assert.deepStrictEqual(ids(await artistSongs(ytm, 'Ado')), ['ado1000000a']);
+});
+
+test('artistSongs: artist search itself fails, exact artist name only', async () => {
+  const ytm = {
+    searchArtists: async () => { throw new Error('400'); },
+    searchSongs: async () => [hit('ado1000000a', 'Usseewa', 'Ado', 'UC_ado'), hit('oth1000000b', 'x', 'ADO Band', 'UC_b')],
+  };
+  assert.deepStrictEqual(ids(await artistSongs(ytm, 'Ado')), ['ado1000000a']);
+});
